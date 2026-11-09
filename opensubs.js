@@ -23,7 +23,7 @@
                 var count = 0;
 
                 response.subtitles.forEach(function (item) {
-                    if (item.lang === 'eng' && item.url) {
+                    if (item.lang === 'eng' && item.url && count < 5) {
                         count++;
                         subs.push({
                             label: '[OpenSub] English #' + count,
