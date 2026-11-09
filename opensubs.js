@@ -6,7 +6,6 @@
 
     var network = new Lampa.Reguest();
 
-    // Принудительно фиксируем контейнер субтитров внизу экрана через CSS
     function fixSubtitlePosition() {
         if (document.getElementById('opensubs-position-fix')) return;
 
