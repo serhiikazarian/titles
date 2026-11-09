@@ -144,6 +144,34 @@
         });
     }
 
+    // Online sources such as MODs' online_mod pass neither season/episode nor the card to the
+    // player, only a Timeline view whose hash is
+    //   Utils.hash(season + (season > 10 ? ':' : '') + episode + original_title)   for an episode
+    //   Utils.hash(original_title)                                                for a film
+    // so the episode can be recovered by checking candidates against it.
+    function episodeFromTimeline(play_data, movie) {
+        var hash = play_data.timeline && play_data.timeline.hash;
+        if (!hash || !Lampa.Utils || !Lampa.Utils.hash) return null;
+
+        var titles = [movie.original_title, movie.original_name].filter(function (t, i, all) {
+            return t && all.indexOf(t) === i;
+        });
+
+        for (var t = 0; t < titles.length; t++) {
+            if (String(Lampa.Utils.hash(titles[t])) === String(hash)) return { movie: true };
+
+            for (var s = 1; s <= 60; s++) {
+                for (var e = 1; e <= 300; e++) {
+                    if (String(Lampa.Utils.hash([s, s > 10 ? ':' : '', e, titles[t]].join(''))) === String(hash)) {
+                        return { season: s, episode: e };
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
     // ---------------------------------------------------------------- merging into the player menu
 
     // Lampa shows one subtitle list at a time: either the URL-based ("custom") list or the
@@ -306,7 +334,10 @@
             disableNative(st, chosen);
         } else {
             silenceNative(st, false);
-            if (isCustom(previous)) {
+            // A URL track may still be drawing even if it never showed in the menu as selected:
+            // Lampa auto-picks one from the source's list, then the HLS track list replaces the menu.
+            var v = video();
+            if (isCustom(previous) || (v && findSelected(v.customSubs))) {
                 stopCustomDrawing(st);
                 chosen.mode     = 'showing';
                 chosen.selected = true;
@@ -345,6 +376,17 @@
         var season   = play_data.season || '';
         var episode  = play_data.episode || '';
         var isSeries = !!(movie.name || movie.original_name || movie.number_of_seasons || season);
+
+        if (!season || !episode) {
+            var found = episodeFromTimeline(play_data, movie);
+            if (found && found.movie) {
+                isSeries = false;
+            } else if (found) {
+                isSeries = true;
+                season   = found.season;
+                episode  = found.episode;
+            }
+        }
 
         resolveImdb(movie, isSeries, function (imdb_id) {
             if (st !== state || !imdb_id) return;
