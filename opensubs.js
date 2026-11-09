@@ -4,15 +4,63 @@
     if (window.plugin_opensubtitles_eng_ready) return;
     window.plugin_opensubtitles_eng_ready = true;
 
-    var network = new Lampa.Reguest();
+    var MAX_SUBS     = 5;
+    var INDEX_OFFSET = 900;   // keeps our tracks clear of HLS/ffprobe track names, which Lampa looks up by index
+    var ACTIVE_CLASS = 'opensubs--active';
+    var RESILENCE_MS = 5000;  // Tizen player re-enables its own subtitles on (re)start, so re-assert periodically
 
-    function fixSubtitlePosition() {
+    var network = new Lampa.Reguest();
+    var state   = null;       // per-playback state; replaced on every 'start', dropped on 'destroy'
+
+    // ---------------------------------------------------------------- helpers
+
+    function isCustom(sub) { return !!sub && typeof sub.url === 'string'; }
+    function isOurs(sub)   { return !!sub && sub.opensubs === true; }
+    function isOff(sub)    { return !!sub && sub.index === -1 && !isCustom(sub); }
+
+    function hasOurs(list) {
+        for (var i = 0; i < list.length; i++) if (isOurs(list[i])) return true;
+        return false;
+    }
+
+    function findSelected(list) {
+        if (!list) return null;
+        for (var i = 0; i < list.length; i++) if (list[i] && list[i].selected) return list[i];
+        return null;
+    }
+
+    function video() {
+        return Lampa.PlayerVideo && Lampa.PlayerVideo.video ? Lampa.PlayerVideo.video() : null;
+    }
+
+    function isTizenPlayer() {
+        return !!(window.webapis && window.webapis.avplay && Lampa.Platform && Lampa.Platform.is('tizen') &&
+                  Lampa.Storage && Lampa.Storage.field('player') == 'tizen');
+    }
+
+    // Lampa's Player.subtitles() deep-clones the list and only attaches its 'mode' handler to
+    // entries without a 'ready' flag. Entries already processed once must be passed back clean,
+    // otherwise they become unselectable.
+    function clean(sub) {
+        var copy = {};
+        for (var key in sub) {
+            if (Object.prototype.hasOwnProperty.call(sub, key) && key !== 'ready' && key !== 'mode' && key !== 'selected') {
+                copy[key] = sub[key];
+            }
+        }
+        return copy;
+    }
+
+    // ---------------------------------------------------------------- styles
+
+    function addStyles() {
         if (document.getElementById('opensubs-position-fix')) return;
 
         var style = document.createElement('style');
         style.id = 'opensubs-position-fix';
+        // Applied only while an OpenSubtitles track is the active one.
         style.innerHTML = [
-            '.player-video__subtitles {',
+            '.player-video__subtitles.' + ACTIVE_CLASS + ' {',
             '    top: auto !important;',
             '    bottom: 3% !important;',
             '    display: flex !important;',
@@ -20,7 +68,7 @@
             '    justify-content: flex-end !important;',
             '    align-items: center !important;',
             '}',
-            '.player-video__subtitles > div, .player-video__subtitles span {',
+            '.player-video__subtitles.' + ACTIVE_CLASS + ' > div, .player-video__subtitles.' + ACTIVE_CLASS + ' span {',
             '    position: static !important;',
             '    transform: none !important;',
             '}'
@@ -29,32 +77,46 @@
         document.head.appendChild(style);
     }
 
-    function fetchOpenSubs(imdb_id, season, episode, callback) {
-        if (!imdb_id) return callback([]);
+    function markActive(on) {
+        try {
+            Lampa.PlayerVideo.render().find('.player-video__subtitles').toggleClass(ACTIVE_CLASS, !!on);
+        } catch (e) {}
+    }
 
-        var type = (season && episode) ? 'series' : 'movie';
+    // ---------------------------------------------------------------- OpenSubtitles
+
+    function fetchOpenSubs(imdb_id, isSeries, season, episode, callback) {
+        if (!/^tt\d+$/.test(String(imdb_id || ''))) return callback([]);
+
         var query = imdb_id;
-        if (type === 'series') {
+        if (isSeries) {
+            // a series id on the movie endpoint gives wrong or no results
+            if (!/^\d+$/.test(String(season)) || !/^\d+$/.test(String(episode))) return callback([]);
             query += ':' + season + ':' + episode;
         }
 
-        var url = 'https://opensubtitles-v3.strem.io/subtitles/' + type + '/' + query + '.json';
+        var url = 'https://opensubtitles-v3.strem.io/subtitles/' + (isSeries ? 'series' : 'movie') + '/' + query + '.json';
 
         network.silent(url, function (response) {
             var subs = [];
-            if (response && response.subtitles && Array.isArray(response.subtitles)) {
-                var count = 0;
+            var seen = {};
 
+            if (response && Array.isArray(response.subtitles)) {
                 response.subtitles.forEach(function (item) {
-                    if (item.lang === 'eng' && item.url && count < 5) {
-                        count++;
-                        subs.push({
-                            label: '[OpenSub] English #' + count,
-                            url: item.url
-                        });
-                    }
+                    if (subs.length >= MAX_SUBS) return;
+                    if (!item || item.lang !== 'eng' || !item.url || seen[item.url]) return;
+
+                    seen[item.url] = true;
+                    subs.push({
+                        label: '[OpenSub] English #' + (subs.length + 1),
+                        url: item.url,
+                        lang: 'en',
+                        index: INDEX_OFFSET + subs.length,
+                        opensubs: true
+                    });
                 });
             }
+
             callback(subs);
         }, function () {
             callback([]);
@@ -63,46 +125,295 @@
         });
     }
 
-    function initPlugin() {
-        fixSubtitlePosition();
+    function resolveImdb(movie, isSeries, callback) {
+        if (movie.imdb_id) return callback(movie.imdb_id);
+        if (!movie.id) return callback(null);
 
-        Lampa.Player.listener.follow('start', function (play_data) {
-            var activity = Lampa.Activity.active();
-            if (!activity || !activity.movie) return;
+        var url = Lampa.TMDB.api((isSeries ? 'tv' : 'movie') + '/' + encodeURIComponent(movie.id) +
+                                 '/external_ids?api_key=' + Lampa.TMDB.key());
 
-            var movie = activity.movie;
-            var imdb_id = movie.imdb_id;
-
-            var season = play_data.season || '';
-            var episode = play_data.episode || '';
-
-            function loadAndApply(id) {
-                fetchOpenSubs(id, season, episode, function (os_subs) {
-                    if (!os_subs.length) return;
-
-                    var current = play_data.subtitles || [];
-                    var merged = current.concat(os_subs);
-
-                    if (Lampa.Player.subtitles) {
-                        Lampa.Player.subtitles(merged);
-                    }
-                });
+        network.silent(url, function (res) {
+            if (res && res.imdb_id) {
+                movie.imdb_id = res.imdb_id;
+                callback(res.imdb_id);
+            } else {
+                callback(null);
             }
-
-            if (imdb_id) {
-                loadAndApply(imdb_id);
-            } else if (movie.id) {
-                var tmdb_type = (movie.name || movie.original_name) ? 'tv' : 'movie';
-                var tmdb_url = Lampa.TMDB.api(tmdb_type + '/' + movie.id + '/external_ids?api_key=' + Lampa.TMDB.key());
-
-                network.silent(tmdb_url, function (res) {
-                    if (res && res.imdb_id) {
-                        movie.imdb_id = res.imdb_id;
-                        loadAndApply(res.imdb_id);
-                    }
-                });
-            }
+        }, function () {
+            callback(null);
         });
+    }
+
+    // Online sources such as MODs' online_mod pass neither season/episode nor the card to the
+    // player, only a Timeline view whose hash is
+    //   Utils.hash(season + (season > 10 ? ':' : '') + episode + original_title)   for an episode
+    //   Utils.hash(original_title)                                                for a film
+    // so the episode can be recovered by checking candidates against it.
+    function episodeFromTimeline(play_data, movie) {
+        var hash = play_data.timeline && play_data.timeline.hash;
+        if (!hash || !Lampa.Utils || !Lampa.Utils.hash) return null;
+
+        var titles = [movie.original_title, movie.original_name].filter(function (t, i, all) {
+            return t && all.indexOf(t) === i;
+        });
+
+        for (var t = 0; t < titles.length; t++) {
+            if (String(Lampa.Utils.hash(titles[t])) === String(hash)) return { movie: true };
+
+            for (var s = 1; s <= 60; s++) {
+                for (var e = 1; e <= 300; e++) {
+                    if (String(Lampa.Utils.hash([s, s > 10 ? ':' : '', e, titles[t]].join(''))) === String(hash)) {
+                        return { season: s, episode: e };
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // ---------------------------------------------------------------- merging into the player menu
+
+    // Lampa shows one subtitle list at a time: either the URL-based ("custom") list or the
+    // player's own tracks (HLS, embedded, Tizen). Player.subtitles() replaces the whole list,
+    // so here we rebuild it from what Lampa already has plus our tracks, and send the menu a
+    // combined list so the player's own tracks stay selectable too.
+    function apply(st) {
+        var v = video();
+        if (!v || st !== state) return;
+
+        // Embedded tracks are only reported to the menu when Lampa has no URL list; read them directly.
+        if (!st.native.length && v.textTracks && v.textTracks.length) {
+            for (var t = 0; t < v.textTracks.length; t++) {
+                var track = v.textTracks[t];
+                if (track && !isCustom(track)) {
+                    st.native.push(track);
+                    if (st.nativeSeen.indexOf(track) < 0) st.nativeSeen.push(track);
+                }
+            }
+        }
+
+        var previous = findSelected(v.customSubs);
+        var base     = (v.customSubs || []).filter(function (s) { return !isOurs(s); }).map(clean);
+
+        st.applying = true;
+        try {
+            Lampa.Player.subtitles(base.concat(st.ours.map(clean)));
+
+            var list = v.customSubs || [];
+
+            // Player.subtitles() stops whatever custom track was playing; bring the selection back.
+            if (previous) {
+                for (var i = 0; i < list.length; i++) {
+                    if (list[i].url === previous.url && list[i].label === previous.label) {
+                        list[i].mode     = 'showing';
+                        list[i].selected = true;
+                        break;
+                    }
+                }
+            }
+
+            if (st.native.length) {
+                st.menu = st.native.concat(list);
+                Lampa.PlayerVideo.listener.send('subs', { subs: st.menu });
+            } else {
+                st.menu = list;
+            }
+        } finally {
+            st.applying = false;
+        }
+
+        st.chosen = null; // re-evaluate on the next tick
+    }
+
+    function scheduleApply(st) {
+        if (st.pending) return;
+        st.pending = true;
+        setTimeout(function () {
+            st.pending = false;
+            if (st === state && st.ours.length) apply(st);
+        }, 0);
+    }
+
+    function onSubsList(e) {
+        var st = state;
+        if (!st || st.applying || !e || !Array.isArray(e.subs)) return;
+
+        var native = e.subs.filter(function (s) { return s && !isCustom(s) && !isOff(s); });
+
+        if (native.length) {
+            st.native = native;
+            native.forEach(function (s) { if (st.nativeSeen.indexOf(s) < 0) st.nativeSeen.push(s); });
+        }
+
+        st.menu   = e.subs;
+        st.chosen = null;
+
+        if (st.ours.length && !hasOurs(e.subs)) scheduleApply(st);
+    }
+
+    // ---------------------------------------------------------------- one active track at a time
+    //
+    // Every subtitle source in Lampa (URL tracks, HLS tracks, Tizen's built-in player) draws
+    // into the same on-screen box. A URL track redraws it on every time update, so when another
+    // source is still running underneath — typically a forced "signs" track in Russian or
+    // Ukrainian that only has lines for on-screen text — its line flashes for a split second
+    // before being overwritten. Lampa never turns those sources off:
+    //   * Tizen's track objects ignore mode = 'disabled', and Lampa forces setSilentSubtitle(false);
+    //   * HLS tracks and native text tracks drop out of the menu once a URL list is set,
+    //     so there is nothing left to switch them off with.
+    // So whenever a track (or "Off") is chosen, everything else is switched off here.
+
+    function silenceNative(st, on) {
+        if (!isTizenPlayer()) return;
+        if (!on && !st.silenced) return;
+
+        try {
+            window.webapis.avplay.setSilentSubtitle(on);
+            st.silenced   = on;
+            st.silencedAt = Date.now();
+        } catch (e) {}
+    }
+
+    function disableNative(st, chosen) {
+        st.nativeSeen.forEach(function (s) {
+            if (s === chosen) return;
+            try {
+                s.mode     = 'disabled';
+                s.selected = false;
+            } catch (e) {}
+        });
+
+        var v = video();
+        if (v && v.textTracks && !isTizenPlayer()) {
+            for (var i = 0; i < v.textTracks.length; i++) {
+                var track = v.textTracks[i];
+                if (track && track !== chosen && track.mode && track.mode !== 'disabled') {
+                    try { track.mode = 'disabled'; } catch (e) {}
+                }
+            }
+        }
+
+        silenceNative(st, true);
+    }
+
+    // Switching from a URL track to a player track leaves the URL track drawing as well.
+    // Re-setting the list stops it without touching the player's own tracks.
+    function stopCustomDrawing(st) {
+        var v = video();
+        if (!v || !v.customSubs) return;
+
+        st.applying = true;
+        try {
+            Lampa.Player.subtitles(v.customSubs.map(clean));
+
+            st.menu = st.native.concat(v.customSubs || []);
+            Lampa.PlayerVideo.listener.send('subs', { subs: st.menu });
+        } finally {
+            st.applying = false;
+        }
+    }
+
+    function onTimeUpdate() {
+        var st = state;
+        if (!st || !st.menu) return;
+
+        var chosen = findSelected(st.menu);
+
+        if (chosen && chosen === st.chosen) {
+            if (st.silenced && Date.now() - st.silencedAt > RESILENCE_MS) silenceNative(st, true);
+            return;
+        }
+
+        var previous = st.chosen;
+        st.chosen = chosen;
+
+        if (!chosen) return;
+
+        if (isCustom(chosen) || isOff(chosen)) {
+            disableNative(st, chosen);
+        } else {
+            silenceNative(st, false);
+            // A URL track may still be drawing even if it never showed in the menu as selected:
+            // Lampa auto-picks one from the source's list, then the HLS track list replaces the menu.
+            var v = video();
+            if (isCustom(previous) || (v && findSelected(v.customSubs))) {
+                stopCustomDrawing(st);
+                chosen.mode     = 'showing';
+                chosen.selected = true;
+                st.chosen       = chosen;
+            }
+        }
+
+        markActive(isOurs(chosen));
+    }
+
+    // ---------------------------------------------------------------- player lifecycle
+
+    function onStart(play_data) {
+        network.clear();
+        state = null;
+        markActive(false);
+
+        if (!play_data || play_data.iptv) return;
+
+        var st = state = {
+            ours: [],
+            native: [],
+            nativeSeen: [],
+            menu: null,
+            chosen: null,
+            applying: false,
+            pending: false,
+            silenced: false,
+            silencedAt: 0
+        };
+
+        var activity = Lampa.Activity.active();
+        var movie    = play_data.card || (activity && activity.movie);
+        if (!movie) return;
+
+        var season   = play_data.season || '';
+        var episode  = play_data.episode || '';
+        var isSeries = !!(movie.name || movie.original_name || movie.number_of_seasons || season);
+
+        if (!season || !episode) {
+            var found = episodeFromTimeline(play_data, movie);
+            if (found && found.movie) {
+                isSeries = false;
+            } else if (found) {
+                isSeries = true;
+                season   = found.season;
+                episode  = found.episode;
+            }
+        }
+
+        resolveImdb(movie, isSeries, function (imdb_id) {
+            if (st !== state || !imdb_id) return;
+
+            fetchOpenSubs(imdb_id, isSeries, season, episode, function (subs) {
+                if (st !== state || !subs.length) return;   // response for a video that is no longer playing
+
+                st.ours = subs;
+                apply(st);
+            });
+        });
+    }
+
+    function onDestroy() {
+        network.clear();
+        state = null;   // Lampa re-enables Tizen subtitles itself on the next playback
+        markActive(false);
+    }
+
+    function initPlugin() {
+        addStyles();
+
+        Lampa.Player.listener.follow('start', onStart);
+        Lampa.Player.listener.follow('destroy', onDestroy);
+
+        Lampa.PlayerVideo.listener.follow('subs', onSubsList);
+        Lampa.PlayerVideo.listener.follow('timeupdate', onTimeUpdate);
     }
 
     if (window.appready) {
