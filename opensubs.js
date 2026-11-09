@@ -60,7 +60,6 @@
 
                     if (Lampa.Player.subtitles) {
                         Lampa.Player.subtitles(merged);
-                        Lampa.Noty.show('OpenSubtitles: loaded ' + os_subs.length + ' English tracks');
                     }
                 });
             }
