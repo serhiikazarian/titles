@@ -14,7 +14,7 @@
         style.innerHTML = [
             '.player-video__subtitles {',
             '    top: auto !important;',
-            '    bottom: 3% !important;',
+            '    bottom: 2% !important;',
             '    display: flex !important;',
             '    flex-direction: column !important;',
             '    justify-content: flex-end !important;',
