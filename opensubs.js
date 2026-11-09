@@ -6,6 +6,30 @@
 
     var network = new Lampa.Reguest();
 
+    // Принудительно фиксируем контейнер субтитров внизу экрана через CSS
+    function fixSubtitlePosition() {
+        if (document.getElementById('opensubs-position-fix')) return;
+
+        var style = document.createElement('style');
+        style.id = 'opensubs-position-fix';
+        style.innerHTML = [
+            '.player-video__subtitles {',
+            '    top: auto !important;',
+            '    bottom: 7% !important;',
+            '    display: flex !important;',
+            '    flex-direction: column !important;',
+            '    justify-content: flex-end !important;',
+            '    align-items: center !important;',
+            '}',
+            '.player-video__subtitles > div, .player-video__subtitles span {',
+            '    position: static !important;',
+            '    transform: none !important;',
+            '}'
+        ].join('\n');
+
+        document.head.appendChild(style);
+    }
+
     function fetchOpenSubs(imdb_id, season, episode, callback) {
         if (!imdb_id) return callback([]);
 
@@ -41,6 +65,8 @@
     }
 
     function initPlugin() {
+        fixSubtitlePosition();
+
         Lampa.Player.listener.follow('start', function (play_data) {
             var activity = Lampa.Activity.active();
             if (!activity || !activity.movie) return;
